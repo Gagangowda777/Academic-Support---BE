@@ -13,11 +13,24 @@ const attachmentSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    // Random server-side name; the original name is only used for downloads.
+    // Unique storage key; the original name is only used for downloads.
     storedName: {
       type: String,
       required: true,
       unique: true,
+    },
+    storageProvider: {
+      type: String,
+      enum: ['local', 'cloudinary'],
+      default: 'local',
+      required: true,
+    },
+    cloudinaryPublicId: {
+      type: String,
+      default: null,
+      required: function requireCloudinaryPublicId() {
+        return this.storageProvider === 'cloudinary';
+      },
     },
     mimeType: {
       type: String,
@@ -29,7 +42,7 @@ const attachmentSchema = new mongoose.Schema(
     },
     kind: {
       type: String,
-      enum: ['document', 'image', 'archive'],
+      enum: ['document', 'image', 'archive', 'video'],
       required: true,
     },
     uploadedBy: {

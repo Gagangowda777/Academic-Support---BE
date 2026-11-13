@@ -29,6 +29,7 @@ const ALLOWED_TYPES = {
   '.jpeg': { mimeType: 'image/jpeg', kind: 'image' },
   '.png': { mimeType: 'image/png', kind: 'image' },
   '.zip': { mimeType: 'application/zip', kind: 'archive' },
+  '.mp4': { mimeType: 'video/mp4', kind: 'video' },
 };
 
 const ALLOWED_EXTENSIONS = Object.keys(ALLOWED_TYPES);

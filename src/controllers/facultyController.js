@@ -7,6 +7,7 @@ const Attachment = require('../models/Attachment');
 const Exam = require('../models/Exam');
 const QuestionPaper = require('../models/QuestionPaper');
 const Notification = require('../models/Notification');
+const { uploadVideo, deleteVideo } = require('../services/cloudinary');
 const { ApiError } = require('../middleware/errorHandler');
 const {
   ALLOWED_EXTENSIONS,
@@ -561,6 +562,8 @@ async function sessionDetail(req, res, next) {
 
 async function uploadMaterial(req, res, next) {
   const files = req.files || [];
+  const cloudinaryAssets = [];
+  const createdAttachments = [];
 
   try {
     const { sessionId } = req.params;
@@ -622,6 +625,17 @@ async function uploadMaterial(req, res, next) {
       }
     }
 
+    const publicIdsByFile = new Map();
+    for (const file of files) {
+      const meta = metaFor(file.originalname);
+      if (meta.kind !== 'video') continue;
+
+      const publicId = `class-materials/${file.filename.replace(/\.mp4$/i, '')}`;
+      const uploaded = await uploadVideo(file.path, publicId);
+      cloudinaryAssets.push(uploaded.public_id);
+      publicIdsByFile.set(file.filename, uploaded.public_id);
+    }
+
     session.material = {
       title,
       description,
@@ -634,23 +648,24 @@ async function uploadMaterial(req, res, next) {
     };
     await session.save();
 
-    const created = [];
-
     for (const file of files) {
       const meta = metaFor(file.originalname);
 
-      created.push(
-        await Attachment.create({
-          session: session._id,
-          originalName: file.originalname,
-          storedName: file.filename,
-          mimeType: meta.mimeType,
-          size: file.size,
-          kind: meta.kind,
-          uploadedBy: req.user._id,
-        })
-      );
+      const attachment = await Attachment.create({
+        session: session._id,
+        originalName: file.originalname,
+        storedName: file.filename,
+        storageProvider: meta.kind === 'video' ? 'cloudinary' : 'local',
+        cloudinaryPublicId: publicIdsByFile.get(file.filename) || null,
+        mimeType: meta.mimeType,
+        size: file.size,
+        kind: meta.kind,
+        uploadedBy: req.user._id,
+      });
+      createdAttachments.push(attachment);
     }
+
+    removeFiles(files.filter((file) => publicIdsByFile.has(file.filename)));
 
     const visibilityMessage =
       requestedVisibility === 'draft'
@@ -662,14 +677,28 @@ async function uploadMaterial(req, res, next) {
           : 'Material published to absent students';
 
     return res.status(201).json({
-      message: created.length
-        ? `${visibilityMessage} with ${created.length} attachment${created.length === 1 ? '' : 's'}`
+      message: createdAttachments.length
+        ? `${visibilityMessage} with ${createdAttachments.length} attachment${createdAttachments.length === 1 ? '' : 's'}`
         : visibilityMessage,
-      uploaded: created.map(attachmentDto),
+      uploaded: createdAttachments.map(attachmentDto),
     });
   } catch (error) {
     // Never leave orphaned uploads behind when validation fails.
     removeFiles(files);
+    if (createdAttachments.length) {
+      try {
+        await Attachment.deleteMany({ _id: { $in: createdAttachments.map((item) => item._id) } });
+      } catch (cleanupError) {
+        console.error('[faculty] uploaded attachment cleanup failed:', cleanupError.message);
+      }
+    }
+    for (const publicId of cloudinaryAssets) {
+      try {
+        await deleteVideo(publicId);
+      } catch (cleanupError) {
+        console.error('[faculty] uploaded video cleanup failed:', cleanupError.message);
+      }
+    }
     return next(error);
   }
 }

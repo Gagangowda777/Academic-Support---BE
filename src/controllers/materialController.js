@@ -1,4 +1,5 @@
 const fs = require('fs');
+const https = require('https');
 const mongoose = require('mongoose');
 const path = require('path');
 const Attachment = require('../models/Attachment');
@@ -6,8 +7,14 @@ const Attendance = require('../models/Attendance');
 const MaterialAccess = require('../models/MaterialAccess');
 const { ApiError } = require('../middleware/errorHandler');
 const { UPLOAD_DIR } = require('../middleware/upload');
+const { authenticatedVideoUrl } = require('../services/cloudinary');
 
-const PREVIEWABLE_TYPES = new Set(['application/pdf', 'image/jpeg', 'image/png']);
+const PREVIEWABLE_TYPES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'video/mp4',
+]);
 
 function batchForEnrollment(enrollmentId) {
   const match = /^TRN(\d{4})/.exec(String(enrollmentId || ''));
@@ -76,6 +83,13 @@ async function loadAuthorizedAttachment(req) {
     throw new ApiError(403, 'You do not have access to this file');
   }
 
+  if (attachment.storageProvider === 'cloudinary') {
+    if (attachment.kind !== 'video' || !attachment.cloudinaryPublicId) {
+      throw new ApiError(404, 'The stored video is unavailable');
+    }
+    return { attachment, filePath: null };
+  }
+
   const root = path.resolve(UPLOAD_DIR);
   const filePath = path.resolve(root, attachment.storedName);
 
@@ -128,10 +142,60 @@ function sendAttachment(res, attachment, filePath, disposition) {
   return res.sendFile(filePath);
 }
 
+function proxyCloudinaryVideo(req, res, attachment, disposition, next) {
+  const safeName = attachment.originalName.replace(/["\r\n]/g, '').trim() || 'material.mp4';
+  const encodedName = encodeURIComponent(safeName);
+  const headers = req.headers.range ? { Range: req.headers.range } : {};
+
+  try {
+    const upstreamRequest = https.get(
+      authenticatedVideoUrl(attachment.cloudinaryPublicId),
+      { headers },
+      (upstream) => {
+        if (!upstream.statusCode || upstream.statusCode < 200 || upstream.statusCode >= 300) {
+          upstream.resume();
+          return next(new ApiError(502, 'Video storage could not serve this file'));
+        }
+
+        res.status(upstream.statusCode);
+        for (const header of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+          if (upstream.headers[header]) res.setHeader(header, upstream.headers[header]);
+        }
+        res.setHeader(
+          'Content-Disposition',
+          `${disposition}; filename="${safeName.replace(/[^\x20-\x7E]/g, '_')}"; filename*=UTF-8''${encodedName}`
+        );
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        upstream.pipe(res);
+      }
+    );
+
+    upstreamRequest.on('error', (error) => {
+      console.error('[materials] Cloudinary video request failed:', error.message);
+      if (!res.headersSent) {
+        next(new ApiError(502, 'Video storage could not serve this file'));
+      } else {
+        res.destroy(error);
+      }
+    });
+
+    req.once('aborted', () => upstreamRequest.destroy());
+    res.once('close', () => {
+      if (!res.writableEnded) upstreamRequest.destroy();
+    });
+  } catch (error) {
+    next(error);
+  }
+}
+
 async function downloadAttachment(req, res, next) {
   try {
     const { attachment, filePath } = await loadAuthorizedAttachment(req);
     await recordStudentAccess(req, attachment, 'download');
+    if (attachment.storageProvider === 'cloudinary') {
+      return proxyCloudinaryVideo(req, res, attachment, 'attachment', next);
+    }
     return sendAttachment(res, attachment, filePath, 'attachment');
   } catch (error) {
     return next(error);
@@ -139,9 +203,8 @@ async function downloadAttachment(req, res, next) {
 }
 
 /**
- * Serves PDFs and images inline. The browser still cannot display Office
- * documents or ZIP archives, so those are rejected instead of being rendered
- * as untrusted HTML.
+ * Serves PDFs, images, and MP4 videos inline. Office documents and ZIP
+ * archives are rejected instead of being rendered as untrusted HTML.
  */
 async function previewAttachment(req, res, next) {
   try {
@@ -152,6 +215,9 @@ async function previewAttachment(req, res, next) {
     }
 
     await recordStudentAccess(req, attachment, 'preview');
+    if (attachment.storageProvider === 'cloudinary') {
+      return proxyCloudinaryVideo(req, res, attachment, 'inline', next);
+    }
     return sendAttachment(res, attachment, filePath, 'inline');
   } catch (error) {
     return next(error);
