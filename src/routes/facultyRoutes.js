@@ -6,6 +6,9 @@ const {
   subjectStudents,
   sessionDetail,
   uploadMaterial,
+  replaceMaterialAttachment,
+  deleteMaterialAttachment,
+  deleteSessionMaterial,
   notifications,
   markNotificationsRead,
 } = require('../controllers/facultyController');
@@ -53,6 +56,13 @@ router.post(
   upload.array('files', MAX_FILES),
   uploadMaterial
 );
+router.delete('/sessions/:sessionId/material', deleteSessionMaterial);
+router.patch(
+  '/materials/:attachmentId',
+  upload.single('file'),
+  replaceMaterialAttachment
+);
+router.delete('/materials/:attachmentId', deleteMaterialAttachment);
 
 // Question-paper sets for an upcoming examination.
 router.get('/question-papers', listFacultyPapers);

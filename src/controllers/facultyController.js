@@ -1,4 +1,6 @@
+const fs = require('fs');
 const mongoose = require('mongoose');
+const path = require('path');
 const Subject = require('../models/Subject');
 const User = require('../models/User');
 const Session = require('../models/Session');
@@ -13,6 +15,7 @@ const {
   ALLOWED_EXTENSIONS,
   MAX_FILE_BYTES,
   MAX_ZIP_BYTES,
+  UPLOAD_DIR,
   metaFor,
   removeFiles,
   policyError,
@@ -60,6 +63,38 @@ function attachmentDto(attachment) {
     size: attachment.size,
     kind: attachment.kind,
   };
+}
+
+async function assertOwnedAttachment(attachmentId, facultyId) {
+  if (!mongoose.isValidObjectId(attachmentId)) throw new ApiError(400, 'Invalid attachment');
+
+  const attachment = await Attachment.findById(attachmentId);
+  if (!attachment) throw new ApiError(404, 'Attachment not found');
+
+  await assertOwnedSession(attachment.session, facultyId);
+  return attachment;
+}
+
+async function removeAttachmentStorage(attachment) {
+  if (attachment.storageProvider === 'cloudinary') {
+    if (!attachment.cloudinaryPublicId) {
+      throw new ApiError(404, 'The stored video is unavailable');
+    }
+    await deleteVideo(attachment.cloudinaryPublicId);
+    return;
+  }
+
+  const root = path.resolve(UPLOAD_DIR);
+  const filePath = path.resolve(root, attachment.storedName);
+  if (!filePath.startsWith(`${root}${path.sep}`)) {
+    throw new ApiError(400, 'Invalid file reference');
+  }
+
+  try {
+    await fs.promises.unlink(filePath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
 }
 
 function countAttendance(records) {
@@ -703,6 +738,106 @@ async function uploadMaterial(req, res, next) {
   }
 }
 
+async function replaceMaterialAttachment(req, res, next) {
+  const file = req.file;
+  let uploadedPublicId = null;
+  let saved = false;
+
+  try {
+    if (!file) throw new ApiError(400, 'Choose a replacement file');
+
+    const attachment = await assertOwnedAttachment(req.params.attachmentId, req.user._id);
+    const meta = metaFor(file.originalname);
+    if (!meta) throw policyError('Unsupported file type');
+    if (meta.kind === 'archive' && file.size > MAX_ZIP_BYTES) {
+      throw policyError('Zip archives must be 10 MB or smaller');
+    }
+
+    if (meta.kind === 'video') {
+      uploadedPublicId = `class-materials/${file.filename.replace(/\.mp4$/i, '')}`;
+      await uploadVideo(file.path, uploadedPublicId);
+    }
+
+    const previousStorage = {
+      storageProvider: attachment.storageProvider,
+      cloudinaryPublicId: attachment.cloudinaryPublicId,
+      storedName: attachment.storedName,
+    };
+
+    attachment.originalName = file.originalname;
+    attachment.storedName = file.filename;
+    attachment.storageProvider = meta.kind === 'video' ? 'cloudinary' : 'local';
+    attachment.cloudinaryPublicId = uploadedPublicId;
+    attachment.mimeType = meta.mimeType;
+    attachment.size = file.size;
+    attachment.kind = meta.kind;
+    await attachment.save();
+    saved = true;
+
+    if (meta.kind === 'video') removeFiles([file]);
+
+    let warning = null;
+    try {
+      await removeAttachmentStorage(previousStorage);
+    } catch (cleanupError) {
+      console.error('[faculty] replaced attachment cleanup failed:', cleanupError.message);
+      warning = 'The new file was saved, but the previous file could not be removed.';
+    }
+
+    return res.status(200).json({
+      message: 'Attachment replaced',
+      warning,
+      attachment: attachmentDto(attachment),
+    });
+  } catch (error) {
+    if (!saved) {
+      removeFiles([file]);
+      if (uploadedPublicId) {
+        try {
+          await deleteVideo(uploadedPublicId);
+        } catch (cleanupError) {
+          console.error('[faculty] replacement upload cleanup failed:', cleanupError.message);
+        }
+      }
+    }
+    return next(error);
+  }
+}
+
+async function deleteMaterialAttachment(req, res, next) {
+  try {
+    const attachment = await assertOwnedAttachment(req.params.attachmentId, req.user._id);
+    await removeAttachmentStorage(attachment);
+    await attachment.deleteOne();
+
+    return res.status(200).json({ message: 'Attachment deleted' });
+  } catch (error) {
+    return next(error);
+  }
+}
+
+async function deleteSessionMaterial(req, res, next) {
+  try {
+    const { sessionId } = req.params;
+    if (!mongoose.isValidObjectId(sessionId)) throw new ApiError(400, 'Invalid session');
+
+    const session = await assertOwnedSession(sessionId, req.user._id);
+    const attachments = await Attachment.find({ session: session._id });
+
+    for (const attachment of attachments) {
+      await removeAttachmentStorage(attachment);
+      await attachment.deleteOne();
+    }
+
+    session.material = null;
+    await session.save();
+
+    return res.status(200).json({ message: 'Material deleted' });
+  } catch (error) {
+    return next(error);
+  }
+}
+
 async function notifications(req, res, next) {
   try {
     const rows = await Notification.find({ recipient: req.user._id })
@@ -766,6 +901,9 @@ module.exports = {
   subjectStudents,
   sessionDetail,
   uploadMaterial,
+  replaceMaterialAttachment,
+  deleteMaterialAttachment,
+  deleteSessionMaterial,
   notifications,
   markNotificationsRead,
 };
